@@ -12,6 +12,12 @@ module main
 //   and fall back to _get_osfhandle(fd).
 // * There is no SIGWINCH: read_stdin() polls the console size on every call
 //   and prepends the same VT resize report the nix build injects on signal.
+// * The console input handle is signaled by *any* queued INPUT_RECORD, but
+//   ReadFile only turns some of them into bytes (key releases, modifier
+//   presses and focus events produce nothing). Timed reads therefore filter
+//   those byteless records first (wait_stdin_readable) and switch_modes()
+//   flushes the queue once at startup, or the first frame would black-screen
+//   until the next real keypress.
 // * msvcrt fds are switched to binary mode in sys_init() so redirected
 //   pipes carry raw bytes (no CRLF/^Z translation).
 //
@@ -33,6 +39,11 @@ fn C.SetConsoleOutputCP(code_page u32) bool
 fn C.GetConsoleScreenBufferInfo(handle C.HANDLE, info &C.CONSOLE_SCREEN_BUFFER_INFO) bool
 fn C.CreateFileW(file_name &u16, desired_access u32, share_mode u32, security voidptr, disposition u32, flags u32, template voidptr) voidptr
 fn C.GetFileInformationByHandle(handle voidptr, info &C.BY_HANDLE_FILE_INFORMATION) bool
+fn C.FlushConsoleInputBuffer(handle voidptr) bool
+fn C.GetNumberOfConsoleInputEvents(handle voidptr, count &u32) bool
+fn C.PeekConsoleInputA(handle voidptr, rec voidptr, length u32, read &u32) bool
+fn C.ReadConsoleInputA(handle voidptr, rec voidptr, length u32, read &u32) bool
+fn C.GetTickCount() u32
 fn C._errno() &int
 
 // ---- Win32 structures, ABI-matching ---------------------------------------
@@ -88,6 +99,18 @@ mut:
 	nFileIndexLow         u32
 }
 
+// https://learn.microsoft.com/en-us/windows/console/input-record-str
+// INPUT_RECORD is 20 bytes: a 4-byte header (EventType u16 + 2 bytes padding)
+// followed by the 16-byte Event union, whose KEY_EVENT_RECORD view is
+//   bKeyDown i32 @4, wRepeatCount u16 @8, wVirtualKeyCode u16 @10,
+//   wVirtualScanCode u16 @12, uChar u16 @14, dwControlKeyState u32 @16.
+// V cannot mirror this layout usefully: in C the event fields live inside the
+// anonymous `Event` union (rec.Event.KeyEvent.bKeyDown), so a @[typedef]
+// struct with flat fields would compile to illegal direct member access (tcc:
+// "field not found"). wait_stdin_readable() therefore peeks records into a
+// plain 20-byte buffer and decodes the three fields it needs with
+// parse_input_record_head() below.
+
 struct SysState {
 mut:
 	stdin_fd              int
@@ -130,11 +153,28 @@ const win_enable_virtual_terminal_input = u32(0x0200)
 const win_enable_virtual_terminal_processing = u32(0x0004)
 const win_disable_newline_auto_return = u32(0x0008)
 
-// WaitForSingleObject timeout result (synchapi.h WAIT_TIMEOUT). A WAIT_FAILED
-// (((DWORD)-1), i.e. -1 through the i32 the builtin declaration returns) is
-// not checked explicitly: the non-waitable-handle case just falls through to
-// the blocking read below.
+// WaitForSingleObject results (synchapi.h): WAIT_TIMEOUT, and WAIT_FAILED
+// (((DWORD)-1), seen as -1 through the i32 the builtin declaration returns —
+// the handle is not waitable, e.g. a pipe instead of a console).
 const win_wait_timeout = 0x0000_0102
+const win_wait_failed = -1
+
+// INPUT_RECORD EventType values (wincon.h): only these two ever produce bytes
+// for ReadFile under ENABLE_VIRTUAL_TERMINAL_INPUT.
+const win_event_type_key = u16(0x0001) // KEY_EVENT
+const win_event_type_mouse = u16(0x0002) // MOUSE_EVENT
+
+// winuser.h virtual-key codes of modifier-only keys. With VT input enabled
+// the console never turns a bare modifier press/release into input bytes, so
+// ReadFile skips those records and would keep blocking; see
+// wait_stdin_readable().
+const win_modifier_vks = [
+	u16(0x10), // VK_SHIFT
+	u16(0x11), // VK_CONTROL
+	u16(0x12), // VK_MENU (Alt)
+	u16(0x5b), // VK_LWIN
+	u16(0x5c), // VK_RWIN
+]!
 
 // fileapi.h CreateFileA constants.
 const win_generic_read = u32(0x8000_0000) // GENERIC_READ
@@ -260,6 +300,14 @@ pub fn switch_modes() ! {
 		return error('SetConsoleMode(stdin) failed')
 	}
 
+	// Drop stale input records left over from before edit started — most
+	// importantly the Enter key-up (KEY_EVENT with bKeyDown == 0) of the very
+	// command line that launched us. Such records never produce bytes for
+	// ReadFile, but they keep the console input handle signaled, which is
+	// exactly the state that used to black-screen the first frame (see
+	// wait_stdin_readable). Best effort: a failure here is harmless.
+	C.FlushConsoleInputBuffer(g_sys.stdin_console_handle)
+
 	// stdout: enable VT processing and stop the console from turning our LF
 	// into CRLF (the editor emits explicit CRs).
 	out_mode |= win_enable_virtual_terminal_processing | win_disable_newline_auto_return
@@ -308,6 +356,125 @@ fn get_window_size() (u16, u16) {
 	return u16(80), u16(24)
 }
 
+// parse_input_record_head extracts (EventType, bKeyDown, wVirtualKeyCode)
+// from the 20-byte INPUT_RECORD at buf. Little-endian loads: console input
+// records are produced by Windows on x86/x64, both little-endian. Field
+// offsets follow the KEY_EVENT_RECORD view of the Event union (see the layout
+// note above the constants).
+fn parse_input_record_head(buf []u8) (u16, i32, u16) {
+	event_type := u16(buf[0]) | (u16(buf[1]) << 8)
+	key_down := i32(u32(buf[4]) | (u32(buf[5]) << 8) | (u32(buf[6]) << 16) | (u32(buf[7]) << 24))
+	vk := u16(buf[10]) | (u16(buf[11]) << 8)
+	return event_type, key_down, vk
+}
+
+// wait_stdin_readable waits up to timeout_ms for console input that will
+// actually produce bytes for the C.read()/ReadFile call that follows, and
+// reports whether such input is (or may be) available.
+//
+// Why this exists: the console input handle is signaled whenever *any*
+// INPUT_RECORD is queued, but ReadFile only consumes records that carry bytes
+// and keeps blocking on the rest. Records that look like activity but never
+// produce bytes under ENABLE_VIRTUAL_TERMINAL_INPUT are:
+//   * KEY_EVENT with bKeyDown == 0 (key releases),
+//   * key-down of modifier-only keys (Shift/Ctrl/Alt/Win, see
+//     win_modifier_vks) — VT input encodes modifiers into the *next* real
+//     key's sequence instead of emitting bytes for the press itself,
+//   * FOCUS_EVENT / other non-key, non-mouse records (e.g. focus changes
+//     when the user alt-tabs away).
+// Waiting on the raw handle and then calling ReadFile therefore blocked
+// indefinitely whenever only such stale records were queued: the very first
+// read_stdin() after launch (the launching shell's Enter key-up was still in
+// the queue) never returned, so the startup resize report could not be
+// injected and the editor sat on a black screen until the next real keypress.
+//
+// Returns:
+//   true  — a byte-producing record is pending; the caller must read now.
+//   false — the timeout expired with nothing byte-producing pending; the
+//           caller takes its timeout path ('').
+//   true is also returned when the handle is not waitable / not a console
+//   input buffer (WAIT_FAILED, or the console query calls fail — e.g. pipes
+//   after a redirect): the caller then falls through to a plain blocking
+//   C.read(), preserving the pre-existing semantics for redirected stdin.
+fn wait_stdin_readable(timeout_ms int) bool {
+	// GetTickCount() (u32 ms) instead of GetTickCount64(): the tcc import
+	// library V links against only carries the legacy kernel32 exports. The
+	// u32 counter wraps every ~49.7 days; the signed difference of two u32
+	// ticks stays correct across a wrap, which is all we rely on (a single
+	// wait here spans milliseconds).
+	deadline := C.GetTickCount() + u32(timeout_ms)
+	for {
+		mut remaining := u32(deadline) - C.GetTickCount()
+		if i32(remaining) < 0 {
+			// Wrapped past the deadline: probe once without waiting.
+			remaining = 0
+		}
+		waited := C.WaitForSingleObject(g_sys.stdin_console_handle, i32(remaining))
+		if waited == win_wait_timeout {
+			return false
+		}
+		if waited == win_wait_failed {
+			// Not a waitable handle (pipe/device): blocking read is the
+			// caller's business.
+			return true
+		}
+
+		// WAIT_OBJECT_0: at least one INPUT_RECORD is queued — but it may be
+		// a byteless one. Peek at the front of the queue and skip records
+		// that ReadFile would refuse to turn into bytes.
+		mut count := u32(0)
+		if !C.GetNumberOfConsoleInputEvents(g_sys.stdin_console_handle, &count) {
+			return true
+		}
+		if count == 0 {
+			// Queue drained by an earlier filter round of this call.
+			return false
+		}
+
+		mut readable := false
+		mut rec_buf := [20]u8{} // sizeof(INPUT_RECORD)
+		for count > 0 {
+			mut peeked := u32(0)
+			if !C.PeekConsoleInputA(g_sys.stdin_console_handle, &rec_buf[0], u32(1), &peeked)
+				|| peeked == 0 {
+				// Can't inspect the queue: be conservative, let the caller
+				// read.
+				return true
+			}
+			event_type, key_down, vk := parse_input_record_head(rec_buf[..])
+			if event_type == win_event_type_key && key_down != 0 && vk !in win_modifier_vks {
+				readable = true
+				break
+			}
+			if event_type == win_event_type_mouse {
+				// VT input mode encodes mouse activity as SGR sequences.
+				readable = true
+				break
+			}
+			// Stale record (key-up, modifier key-down, focus event, ...):
+			// consume and drop exactly this one, then look at the next.
+			mut dropped := u32(0)
+			if !C.ReadConsoleInputA(g_sys.stdin_console_handle, &rec_buf[0], u32(1), &dropped)
+				|| dropped == 0 {
+				return true
+			}
+			count--
+		}
+		if readable {
+			return true
+		}
+		// The queue held nothing but byteless records and is now empty.
+		if timeout_ms == 0 {
+			return false
+		}
+		// Otherwise loop and wait out the remaining budget (the deadline is
+		// recomputed from the wall clock, so total wait never exceeds
+		// timeout_ms).
+	}
+	// Unreachable: the loop above exits only through the returns inside.
+	return false
+}
+
 // read_stdin reads from stdin.
 //
 // timeout_ms follows vt.v's convention: vt_no_timeout (-1) blocks
@@ -332,14 +499,18 @@ pub fn read_stdin(timeout_ms int) ?string {
 	mut tmp := [4096]u8{}
 	for {
 		if timeout != vt_no_timeout {
-			// WaitForSingleObject on the console input handle reports input
-			// availability. WAIT_FAILED means the handle is not waitable
-			// (some pipes/devices): fall through to a plain blocking read.
-			waited := C.WaitForSingleObject(g_sys.stdin_console_handle, i32(timeout))
-			if waited == win_wait_timeout {
+			// Only proceed to the read when input that produces bytes is
+			// actually pending (or stdin is not a console at all, in which
+			// case wait_stdin_readable() says true and the plain blocking
+			// C.read() below applies). false means the timeout budget was
+			// exhausted on byteless stale records or no input at all.
+			if !wait_stdin_readable(timeout) {
 				break // Timeout? We can stop reading.
 			}
 		}
+		// timeout == vt_no_timeout: plain blocking read. ReadFile skips
+		// byteless records by itself and keeps waiting, which is exactly the
+		// desired semantics for an indefinite read.
 
 		ret := C.read(g_sys.stdin_fd, &tmp[0], usize(tmp.len))
 		if ret > 0 {
