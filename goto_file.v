@@ -390,6 +390,6 @@ fn (mut ed Editor) draw_goto_file() {
 			right: r.right
 			bottom: r.bottom
 		}
-		ed.fb.draw_scrollbar(r, track, ed.goto_file_scroll, ed.goto_file_filtered.len)
+		ed.fb.draw_scrollbar(r, track, CoordType(ed.goto_file_scroll), CoordType(ed.goto_file_filtered.len))
 	}
 }

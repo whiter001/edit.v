@@ -545,16 +545,16 @@ fn (mut fb Framebuffer) draw_scrollbar(clip_rect Rect, track Rect, content_offse
 	mut fract_buf := [u8(0xE2), 0x96, 0x88]
 	if top_fract != 0 {
 		fract_buf[2] = u8(0x88 - top_fract)
-		fb.replace_text(thumb_top - 1, track_clipped.left, track_clipped.right, fract_buf[0..3].bytestr())
+		fb.replace_text(CoordType(thumb_top - 1), track_clipped.left, track_clipped.right, fract_buf[0..3].bytestr())
 	}
 	if bottom_fract != 0 {
 		fract_buf[2] = u8(0x88 - bottom_fract)
-		fb.replace_text(thumb_bottom, track_clipped.left, track_clipped.right, fract_buf[0..3].bytestr())
+		fb.replace_text(CoordType(thumb_bottom), track_clipped.left, track_clipped.right, fract_buf[0..3].bytestr())
 		mut rect := Rect{
 			left: track_clipped.left
-			top: thumb_bottom
+			top: CoordType(thumb_bottom)
 			right: track_clipped.right
-			bottom: thumb_bottom + 1
+			bottom: CoordType(thumb_bottom + 1)
 		}
 		fb.blend_bg(mut rect, fb.indexed(IndexedColor.bright_white))
 		fb.blend_fg(mut rect, fb.indexed(IndexedColor.bright_black))

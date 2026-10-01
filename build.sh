@@ -20,6 +20,7 @@
 #   DEBUG_FLAGS=...        # 附加到 v -debug 的 flag
 #   MEMLIMIT_MB=2048       # 编译进程树内存上限（MB），0 = 关闭
 #   TEST_MEMLIMIT_MB=4096  # v test 进程树内存上限（MB），MEMLIMIT_MB=0 时同样关闭
+#                          # （Git Bash/MSYS 下 ps 不支持 -axo 时看门狗自动跳过）
 
 set -euo pipefail
 
@@ -58,7 +59,8 @@ require_v() {
 # ---------- 内存看门狗 -----------------------------------------------------
 # V 工具链偶发内存失控，会把整机拖死。macOS 的 ulimit -v 不生效，所以用
 # 轮询看门狗：后台跑命令，每秒统计其进程树 RSS 总量，超限就整树杀掉。
-# MEMLIMIT_MB=0 关闭限制。
+# MEMLIMIT_MB=0 关闭限制。Git Bash/MSYS 的 ps 不支持 -axo，探测失败时自动
+# 跳过看门狗（只打一句 warn），目标命令照常运行。
 
 MEMLIMIT_MB="${MEMLIMIT_MB:-2048}"
 TEST_MEMLIMIT_MB="${TEST_MEMLIMIT_MB:-4096}"
@@ -96,6 +98,14 @@ _tree_pids() {
 
 run_with_memlimit() {
     if [[ "$MEMLIMIT_MB" == "0" ]]; then
+        "$@"
+        return
+    fi
+    # 探测一次 ps -axo：Git Bash/MSYS 的 ps 不支持该选项，配合
+    # set -euo pipefail 会让看门狗循环里的轮询直接杀掉整个脚本，而编译还在
+    # 后台孤儿进程里跑。探测失败就跳过看门狗，正常运行目标命令。
+    if ! ps -axo pid=,ppid=,rss= </dev/null >/dev/null 2>&1; then
+        warn "ps 不支持 -axo，跳过内存看门狗（Git Bash/MSYS 环境）"
         "$@"
         return
     fi
@@ -235,6 +245,7 @@ Modes:
   DEBUG_FLAGS   附加到 v -debug 的 flag，例如 DEBUG_FLAGS="-cflags -g"
   MEMLIMIT_MB   编译进程树内存上限，MB（默认 2048，0 = 关闭）
   TEST_MEMLIMIT_MB  v test 进程树内存上限，MB（默认 4096；MEMLIMIT_MB=0 时同样关闭）
+                Git Bash/MSYS 下 ps 不支持 -axo 时，看门狗自动跳过并 warn 一句。
 EOF
 }
 

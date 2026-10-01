@@ -384,7 +384,11 @@ fn main() {
 
 	if stdin_redirected {
 		reopen_stdin_if_redirected() or {
-			eprintln('edit: cannot reopen /dev/tty: ${err}')
+			$if windows {
+				eprintln('edit: cannot reopen CONIN$: ${err}')
+			} $else {
+				eprintln('edit: cannot reopen /dev/tty: ${err}')
+			}
 			exit(1)
 		}
 	}

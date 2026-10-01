@@ -335,7 +335,7 @@ fn (mut ed Editor) draw_language_picker(status_y CoordType) {
 	}
 	list_h := ed.language_picker_list_height(status_y)
 	height := list_h + 1
-	mut top := status_y - height
+	mut top := status_y - CoordType(height)
 	if top < 1 {
 		top = 1
 	}

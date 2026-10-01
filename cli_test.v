@@ -1,11 +1,16 @@
 module main
 
+import os
+
 fn test_parse_cli_args_basics() {
 	opts := parse_cli_args(['a.txt', 'b.txt'], '/work') or { panic(err) }
 	assert opts.action == .run
 	assert opts.paths.len == 2
-	assert opts.paths[0].path == '/work/a.txt'
-	assert opts.paths[1].path == '/work/b.txt'
+	// Expected paths are built with the same os primitives
+	// normalize_document_path() uses, so the assertions stay
+	// separator-agnostic across POSIX and Windows.
+	assert opts.paths[0].path == os.join_path('/work', 'a.txt')
+	assert opts.paths[1].path == os.join_path('/work', 'b.txt')
 }
 
 fn test_parse_cli_args_help_version_and_errors() {
@@ -22,7 +27,7 @@ fn test_parse_cli_args_help_version_and_errors() {
 fn test_parse_cli_args_double_dash_and_stdin() {
 	opts := parse_cli_args(['--', '-name'], '/work') or { panic(err) }
 	assert opts.paths.len == 1
-	assert opts.paths[0].path == '/work/-name'
+	assert opts.paths[0].path == os.join_path('/work', '-name')
 
 	stdin_opts := parse_cli_args(['a.txt', '-', 'ignored.txt'], '/work') or { panic(err) }
 	assert stdin_opts.stdin_input

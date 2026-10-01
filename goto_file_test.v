@@ -84,9 +84,12 @@ fn test_goto_file_list_height_subtracts_title_and_filter() {
 
 fn test_goto_file_entry_text_named_clean() {
 	// A named, non-dirty document gets "  <path>" (two-space mark).
+	// add_document normalizes the path with os.abs_path, so the expectation
+	// is built the same way instead of hardcoding a separator.
+	fixture := os.abs_path('/tmp/foo.txt')
 	mut ed := fresh_editor_with_buffer()
 	add_goto_test_document(mut ed, '/tmp/foo.txt') or { return }
-	assert ed.goto_file_entry_text(1) == '  /tmp/foo.txt'
+	assert ed.goto_file_entry_text(1) == '  ${fixture}'
 }
 
 fn test_goto_file_entry_text_untitled() {

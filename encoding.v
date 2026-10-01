@@ -106,9 +106,76 @@ fn decode_file(bytes []u8, encoding string) !string {
 	}
 	payload := encoding_payload(bytes, encoding)
 	source := if encoding == 'UTF-8 BOM' { 'UTF-8' } else { encoding }
+	// vlib's iconv Windows backend converts invalid UTF-8 leniently (its
+	// MultiByteToWideChar path replaces malformed sequences instead of
+	// failing), so 'UTF-8' and 'UTF-8 BOM' inputs are validated here first.
+	// Every other encoding keeps its previous iconv-driven behavior.
+	if source == 'UTF-8' && !utf8_validate_strict(payload) {
+		return error('invalid ${encoding} input: malformed UTF-8')
+	}
 	return iconv.encoding_to_vstring(payload, source) or {
 		return error('invalid ${encoding} input: ${err}')
 	}
+}
+
+// utf8_validate_strict reports whether bytes are well-formed UTF-8 per RFC
+// 3629: correct lead/continuation structure, no overlong encodings, no UTF-16
+// surrogates, and no code points above U+10FFFF. See decode_file for why this
+// check lives outside iconv.
+fn utf8_validate_strict(bytes []u8) bool {
+	mut i := 0
+	for i < bytes.len {
+		b := bytes[i]
+		if b < 0x80 {
+			i++
+			continue
+		}
+		mut seq_len := 0
+		mut lead_mask := u8(0)
+		mut min_cp := u32(0)
+		mut max_cp := u32(0)
+		if (b & 0xE0) == 0xC0 {
+			seq_len = 2
+			lead_mask = 0x1F
+			min_cp = 0x80
+			max_cp = 0x7FF
+		} else if (b & 0xF0) == 0xE0 {
+			seq_len = 3
+			lead_mask = 0x0F
+			min_cp = 0x800
+			max_cp = 0xFFFF
+		} else if (b & 0xF8) == 0xF0 {
+			seq_len = 4
+			lead_mask = 0x07
+			min_cp = 0x1_0000
+			max_cp = 0x10_FFFF
+		} else {
+			// Continuation bytes (0x80-0xBF), overlong 2-byte leads
+			// (0xC0-0xC1) and anything above 4-byte leads are never valid.
+			return false
+		}
+		if i + seq_len > bytes.len {
+			return false
+		}
+		mut cp := u32(b & lead_mask)
+		for k := 1; k < seq_len; k++ {
+			cb := bytes[i + k]
+			if (cb & 0xC0) != 0x80 {
+				return false
+			}
+			cp = (cp << 6) | u32(cb & 0x3F)
+		}
+		// Surrogates only ever appear in 3-byte sequences, but checking the
+		// decoded value keeps the rule in one place.
+		if cp >= 0xD800 && cp <= 0xDFFF {
+			return false
+		}
+		if cp < min_cp || cp > max_cp {
+			return false
+		}
+		i += seq_len
+	}
+	return true
 }
 
 fn encoding_bom(encoding string) []u8 {
